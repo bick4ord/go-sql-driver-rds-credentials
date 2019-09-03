@@ -3,14 +3,10 @@ package store
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
-
 	"github.com/a-h/go-sql-driver-rds-credentials/store/certs"
-
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -21,19 +17,15 @@ type secretGetter interface {
 
 // RDS store, backed by AWS Secrets Manager.
 type RDS struct {
-	child    secretGetter
+	dsn      *DSN
 	config   *mysql.Config
-	previous string
 	m        *sync.Mutex
-	dsn      string
 }
 
-// NewRDS creates a new RDS store, passing the name of the secret, and a template DSN.
-// user:password@tcp(host:port)/dbname?parseTime=true&multiStatements=true&collation=utf8mb4_unicode_ci
-func NewRDS(name, dbName string, params map[string]string) (rds *RDS, err error) {
-	conf := mysql.NewConfig()
-	conf.DBName = dbName
-	conf.Params = params
+func NewRDS(dbName string, dbHost string, dbPort string, dbUser string, params map[string]string, credsCB CredsCallbackFn) (rds *RDS, err error) {
+	mysqlConf := mysql.NewConfig()
+	mysqlConf.DBName = dbName
+	mysqlConf.Params = params
 
 	// Load the TLS certificates.
 	var pem []byte
@@ -50,46 +42,37 @@ func NewRDS(name, dbName string, params map[string]string) (rds *RDS, err error)
 	mysql.RegisterTLSConfig("rds", &tls.Config{
 		RootCAs: rcp,
 	})
-	conf.Params["tls"] = "rds"
+	mysqlConf.Params["tls"] = "rds"
 
 	rds = &RDS{
-		child:  New(name),
-		config: conf,
+		dsn:    NewDSN(mysqlConf, dbHost, dbPort, dbUser, credsCB),
+		config: mysqlConf,
 		m:      &sync.Mutex{},
 	}
+
+	// force the first connection
+	_, err = rds.Get(true)
+	if err != nil {
+		err = fmt.Errorf("could not get first DSN: %v", err)
+		return nil, err
+	}
+
 	return
 }
 
-// Get the secret, optionally forcing a refresh.
-func (s *RDS) Get(force bool) (secret string, err error) {
-	j, err := s.child.Get(force)
+// Get the DSN, optionally forcing a refresh.
+func (s *RDS) Get(force bool) (string, error) {
+	dsn, err := s.dsn.Get(force)
 	if err != nil {
-		return
+		return "", err
 	}
-	if j == s.previous {
-		// Don't bother unmarshalling from JSON if nothing has changed.
-		return s.dsn, nil
-	}
-	var r rdsSecret
-	err = json.Unmarshal([]byte(j), &r)
-	if err != nil {
-		return
-	}
-	s.previous = j
-	// It's changed, so update the cached dsn.
-	s.m.Lock()
-	defer s.m.Unlock()
-	s.config.User = r.Username
-	s.config.Passwd = r.Password
-	s.config.Net = "tcp"
-	s.config.Addr = r.Host + ":" + strconv.Itoa(r.Port)
-	s.dsn = s.config.FormatDSN()
-	return s.dsn, nil
+
+	return dsn, nil
 }
 
 // CallsMade to the underlying secret API.
 func (s *RDS) CallsMade() int {
-	return s.child.CallsMade()
+	return s.dsn.CallsMade()
 }
 
 type rdsSecret struct {
